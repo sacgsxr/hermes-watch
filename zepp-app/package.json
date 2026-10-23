@@ -4,8 +4,8 @@
   "private": true,
   "description": "Hermes on the Amazfit Active 2",
   "scripts": {
-    "build": "zeus build",
-    "preview": "zeus preview"
+    "build": "zeus build --legacy-zpk-name",
+    "preview": "zeus preview --legacy-zpk-name"
   },
   "dependencies": {
     "@zeppos/zml": "^0.0.43"
