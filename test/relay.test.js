@@ -27,6 +27,8 @@ async function setup(t, opts = {}) {
     pcHealth: async () => opts.health || '{}',
     cancelRestart: () => 'PC restart cancelled.',
     runAction: async (a) => { ran.push(a); return { ok: true, message: `Sent to ${a.contact}.` }; },
+    actionsEnabled: opts.actionsEnabled === undefined ? true : !!opts.actionsEnabled,
+    notifyEnabled: opts.notifyEnabled === undefined ? true : !!opts.notifyEnabled,
     log: line => logged.push(line),
     recordTurn: e => recorded.push(e),
     notify: text => notified.push(text),
@@ -467,4 +469,59 @@ test('health without auth', async (t) => {
 test('default deadline stays well under the iPhone Zepp fetch limit (20 s replies were lost)', () => {
   const { DEFAULT_DEADLINE_MS } = require('../relay');
   assert.ok(DEFAULT_DEADLINE_MS <= 12000, `got ${DEFAULT_DEADLINE_MS}`);
+});
+
+// The safe slice: actions and notifications are disabled for the production defaults. createServer
+// keeps them on unless told otherwise (every test above runs with them enabled).
+test('safe slice: texts, car and PC-restart phrases go to Hermes instead of confirm cards', async (t) => {
+  const { ask, hermes, ran } = await setup(t, { actionsEnabled: false });
+  for (const phrase of ['text Alex saying hi', 'unlock the car', 'restart my PC']) {
+    const r = await ask({ text: phrase });
+    assert.strictEqual(r.kind, 'answer', phrase);
+    assert.strictEqual(r.text, `echo: ${phrase}`, phrase);
+  }
+  assert.strictEqual(ran.length, 0);
+  assert.strictEqual(hermes.calls.length, 3);
+});
+
+test('safe slice: a confirm id from an action phrase is unknown to the relay', async (t) => {
+  const { ask, call } = await setup(t, { actionsEnabled: false });
+  const r = await ask({ text: 'text Alex saying hi' });
+  assert.strictEqual(r.id, undefined);
+  assert.deepStrictEqual((await call('POST', '/watch/confirm', { id: 'made-up', yes: true })).json,
+    { ok: true, kind: 'answer', text: 'That expired, ask again.' });
+});
+
+test('safe slice: an approved build is not pushed to Telegram when notifications are off', async (t) => {
+  const { ask, confirm, hermes, notified } = await setup(t, { actionsEnabled: false, notifyEnabled: false });
+  const card = await ask({ text: 'build a tide job' });
+  assert.strictEqual(card.approve, true); // streaming approval cards keep working
+  assert.deepStrictEqual(await confirm({ id: card.id, yes: true }), { ok: true, kind: 'answer', text: 'Built: build a tide job' });
+  assert.deepStrictEqual(hermes.approvals.map(a => [a.run, a.choice, a.request_id, a.auth]), [['run-1', 'once', 'req-1', 'Bearer hermes-key']]);
+  assert.deepStrictEqual(notified, []);
+});
+
+test('safe slice: with notifications on, the approved build still goes to Telegram (full behaviour)', async (t) => {
+  const { ask, confirm, notified } = await setup(t, { actionsEnabled: false, notifyEnabled: true });
+  const card = await ask({ text: 'build a tide job' });
+  await confirm({ id: card.id, yes: true });
+  assert.deepStrictEqual(notified, ['From the watch: build a tide job\n\nBuilt: build a tide job']);
+});
+
+test('safe slice: Hermes gets no email-read or Claude Code rules, only the no-actions rule', async (t) => {
+  const { ask, hermes } = await setup(t, { actionsEnabled: false });
+  await ask({ text: 'what time is it' });
+  const { user, system } = hermes.calls[0];
+  assert.match(user, /no direct actions/);
+  for (const banned of ['gmail_mark_read', 'claude_code_build', 'ask_claude_code', 'CONFIRM:', 'Never call send_text']) {
+    assert.doesNotMatch(user, new RegExp(banned.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `${banned} in user`);
+    assert.doesNotMatch(system, new RegExp(banned.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `${banned} in system`);
+  }
+});
+
+test('full behaviour (default): the email and Claude Code rules are still sent to Hermes', async (t) => {
+  const { ask, hermes } = await setup(t);
+  await ask({ text: 'read my emails' });
+  assert.match(hermes.calls[0].user, /Never call send_text/);
+  assert.match(hermes.calls[0].user, /gmail_mark_read FIRST/); // the email rule rides on "read ... emails"
 });

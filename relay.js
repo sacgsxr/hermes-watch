@@ -1,8 +1,12 @@
 // Relay between the Hermes app on an Amazfit watch and Hermes Agent's API server.
 //
-// watch -> Side Service in the Zepp iPhone app -> tailnet https :8453 -> this relay (8796)
+// watch -> Side Service in the Zepp iPhone app -> tailnet https :8453 -> this relay
+//   (127.0.0.1:8796 by default, WATCH_PORT; loopback only)
 //   -> stt/stt_worker.py (8797) to turn the recording into text
-//   -> Hermes API server (8642) in its own "watch-..." session for the answer.
+//   -> Hermes API server (WATCH_HERMES_PORT, 8642 by default) in its own "watch-..." session.
+//
+// Production defaults are read-only: direct actions (texts, car, PC restart) and Telegram
+// notifications stay off unless WATCH_ACTIONS / WATCH_NOTIFY are set to 1.
 //
 // - Texts and car commands ("text X saying Y", "unlock the car", ...) are recognised here in
 //   plain code (lib/actions.js) and only run after a Yes tap: the watch gets a
@@ -19,11 +23,27 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { isResetCommand, formatForHud, truncateForHud, parsePcRestartCommand, cancelPcRestart,
+const { timeString, isResetCommand, formatForHud, truncateForHud, parsePcRestartCommand, cancelPcRestart,
   isPcHealthRequest, gatherPcHealthAsync } = require('./lib/voice-common');
 const { formatPcHealth } = require('./lib/pc-health');
 const actions = require('./lib/actions');
 const { watchSystemPrompt, withWatchRules, splitConfirm, WATCH_CHAR_BUDGET } = require('./lib/watch-prompt');
+
+// The safe slice: the relay asks the already-running Hermes profile and shows its answers;
+// it never sends texts or touches the car or PC itself (relay-only shortcuts like "new session"
+// and the read-only PC health check stay). createServer keeps the full behaviour for tests.
+const NO_ACTION_RULE = 'This watch build has no direct actions: do not propose sending texts, emails or car commands.';
+function promptWithRules(text, rules) {
+  if (!rules || !rules.length) return text;
+  return `${text}\n\n(Rule for this answer: ${rules.join(' ')})`;
+}
+// Minimal system prompt for the safe slice: no email-reading rule, no Claude Code tooling
+// rule, no CONFIRM action proposals - just the watch format and the clock.
+function safeSystemPrompt(now = new Date()) {
+  return `You are answering through Hermes on an Amazfit watch. Current date and time: ${timeString(Intl.DateTimeFormat().resolvedOptions().timeZone)}. `
+    + 'The message is raw speech-to-text: expect misheard words, run-on phrasing and missing punctuation; read it charitably. '
+    + `Plain text only - no markdown, links or images. Under ${WATCH_CHAR_BUDGET} characters. ${NO_ACTION_RULE}`;
+}
 
 const IDLE_MS = 6 * 60 * 60 * 1000;
 const JOB_CAP_MS = 30 * 60 * 1000; // Claude Code builds can take 15 min
@@ -52,6 +72,14 @@ function createServer(opts) {
   const recordTurn = opts.recordTurn || (() => {});
   const tts = opts.tts || ((text) => postTts(new URL('/tts', opts.sttUrl), text));
   const notify = opts.notify || (() => {});
+  const actionsEnabled = !!opts.actionsEnabled;
+  const notifyEnabled = !!opts.notifyEnabled;
+  // Prompt rules for this build: the full watch rules when actions are enabled (the default,
+  // as in tests), or just "no direct actions" for the safe slice.
+  const systemPrompt = opts.systemPrompt !== undefined ? opts.systemPrompt
+    : (actionsEnabled ? watchSystemPrompt : safeSystemPrompt);
+  const turnRules = opts.turnRules || ((text) => actionsEnabled ? withWatchRules(text)
+    : promptWithRules(text, [NO_ACTION_RULE]));
   const jobs = new Map();
 
   let session = readJson(opts.sessionFile);
@@ -85,8 +113,8 @@ function createServer(opts) {
       let settled = false;
       const done = (r) => { if (!settled) { settled = true; resolve(r); } };
       const body = Buffer.from(JSON.stringify({ model: 'hermes-agent', stream: true, messages: [
-        { role: 'system', content: watchSystemPrompt() },
-        { role: 'user', content: withWatchRules(userText) }] }));
+        { role: 'system', content: systemPrompt() },
+        { role: 'user', content: turnRules(userText) }] }));
       up = http.request({ host: '127.0.0.1', port: opts.hermesPort, method: 'POST', path: '/v1/chat/completions', headers: {
         authorization: `Bearer ${opts.hermesKey}`, 'content-type': 'application/json', 'content-length': body.length,
         'x-hermes-session-id': sessionId } }, (res) => {
@@ -200,7 +228,7 @@ function createServer(opts) {
       entry.card = null;
       entry.reply = remember(toReply(heard, done));
       log(`  -> ${done.status} ${Date.now() - started}ms session=${sessionId} job=${job}`);
-      if (entry.approved && entry.reply.text) notify(`From the watch: ${heard || 'your approval'}\n\n${entry.reply.text}`);
+      if (notifyEnabled && entry.approved && entry.reply.text) notify(`From the watch: ${heard || 'your approval'}\n\n${entry.reply.text}`);
       if (entry.wake) entry.wake();
     });
     const reply = await settle(job, entry, started + deadlineMs);
@@ -277,7 +305,9 @@ function createServer(opts) {
         return answered(heard, { ok: true, heard, kind: 'answer', text });
       }
     }
-    const action = actions.parseAction(heard);
+    // Direct actions (texts, car, PC restart) only when enabled; otherwise the words go to
+    // Hermes like any other question.
+    const action = actionsEnabled ? actions.parseAction(heard) : null;
     if (action) {
       const id = actions.createPending(action);
       log(`  -> confirm ${action.kind}${action.tool ? ` ${action.tool}` : ''}`);
@@ -507,9 +537,16 @@ if (require.main === module) {
   const LOG_FILE = path.join(__dirname, 'relay.log');
   const log = line => fs.appendFile(LOG_FILE, `${new Date().toISOString()} ${line}\n`, () => {});
   const config = readJson(process.env.WATCH_CONFIG || path.join(__dirname, 'config.json')) || {};
-  const envFile = path.join(process.env.LOCALAPPDATA || '', 'hermes', '.env');
+  const envFiles = [
+    process.env.HERMES_ENV_FILE,
+    process.env.HERMES_HOME && path.join(process.env.HERMES_HOME, '.env'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'hermes', '.env'),
+  ].filter(Boolean);
   let envText = '';
-  try { envText = fs.readFileSync(envFile, 'utf8'); } catch { /* below */ }
+  let envFile = envFiles[0] || '.env';
+  for (const candidate of envFiles) {
+    try { envText = fs.readFileSync(candidate, 'utf8'); envFile = candidate; break; } catch { /* try next */ }
+  }
   const envValue = (name) => {
     const m = envText.match(new RegExp(`^\\s*${name}\\s*=\\s*(.+)$`, 'm'));
     return m ? m[1].trim().replace(/^["']|["']$/g, '') : '';
@@ -540,17 +577,22 @@ if (require.main === module) {
   };
   if (!config.token) { console.error('config.json needs a "token" (see config.example.json)'); process.exit(1); }
   if (!hermesKey) { console.error(`API_SERVER_KEY not found in ${envFile}`); process.exit(1); }
-  const port = Number(process.env.WATCH_PORT) || 8796;
+  // Safe defaults: no direct actions, no Telegram; opt in with WATCH_ACTIONS=1 / WATCH_NOTIFY=1.
+  const actionsEnabled = process.env.WATCH_ACTIONS === '1';
+  const notifyEnabled = process.env.WATCH_NOTIFY === '1';
+  const port = Number(process.env.WATCH_PORT) || 8798;
   createServer({
     token: config.token,
     hermesKey,
-    hermesPort: Number(process.env.WATCH_HERMES_PORT) || 8642,
+    hermesPort: Number(process.env.WATCH_HERMES_PORT) || 8643,
     sttUrl: process.env.WATCH_STT_URL || 'http://127.0.0.1:8797/stt',
     sessionFile: process.env.WATCH_SESSION_FILE || path.join(__dirname, 'session.json'),
     deadlineMs: Number(process.env.WATCH_DEADLINE_MS) || DEFAULT_DEADLINE_MS,
+    actionsEnabled,
+    notifyEnabled,
     log,
     recordTurn: e => fs.appendFile(process.env.WATCH_TURNS_FILE || path.join(__dirname, 'turns.jsonl'),
       `${JSON.stringify(e)}\n`, () => {}),
-    notify,
+    notify: notifyEnabled ? notify : () => {},
   }).listen(port, '127.0.0.1', () => log(`watch relay listening on 127.0.0.1:${port}`));
 }

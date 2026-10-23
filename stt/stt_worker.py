@@ -2,7 +2,13 @@
 
 POST /stt with the watch recorder's bytes -> {"text", "seconds", "level_db", "ms"}.
 GET /health -> {"ok": true} once Whisper is loaded. POST /tts {"text"} -> MP3 for the watch speaker.
-Listens on 127.0.0.1:8797 only.
+Listens on 127.0.0.1:8797 only (STT_PORT).
+
+TTS speaks with a local, OpenAI-compatible endpoint (Kokoro): TTS_URL is the base URL
+(e.g. http://127.0.0.1:8888), so the relay's speech hook POSTs {"input", "voice",
+"response_format": "mp3"} to <TTS_URL>/v1/audio/speech. TTS_API_KEY is sent as a bearer
+token when set. With no TTS_URL, /tts answers 502 and nothing leaves the machine.
+STT stays local CPU faster-whisper either way; there is no cloud voice fallback.
 
 The Zepp OS Recorder (codec.OPUS) writes no container: each packet is
 [u32 BE length][u32 BE encoder final range][packet] (libopus opus_demo layout), so the
@@ -29,6 +35,10 @@ RATE = 16000
 HERE = Path(__file__).parent
 CAPTURES = HERE / "captures"
 MAX_BYTES = 2_000_000  # ~15 min at the watch's bitrate; the watch caps clips at 15 s
+# Local TTS endpoint (Kokoro, OpenAI-compatible). Empty -> /tts is disabled.
+TTS_URL = os.environ.get("TTS_URL", "").rstrip("/")
+TTS_API_KEY = os.environ.get("TTS_API_KEY", "")
+TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
 
 _model = None
 _model_lock = threading.Lock()
@@ -154,9 +164,9 @@ def level_db(pcm):
 
 
 # --- Spoken answers: text -> small MP3 for the watch ---------------------------------
-# Microsoft's neural voices via edge-tts (free, cloud), re-encoded to 16 kHz mono ~16 kbps so a
-# 15 s answer is ~30 KB over Bluetooth. The watch's Player plays MP3 (Opus only if recorded on it).
-VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
+# The local TTS endpoint (Kokoro, OpenAI-compatible) returns MP3; it is re-encoded to
+# 16 kHz mono ~16 kbps so a 15 s answer is ~30 KB over Bluetooth. The watch's Player plays
+# MP3 (Opus only if recorded on it).
 MP3_BITRATE = 16000
 
 
@@ -190,17 +200,22 @@ def encode_mp3(pcm):
 
 
 def speak(text):
-    import asyncio
-    import edge_tts
+    """text -> MP3 via the local OpenAI-compatible TTS endpoint (Kokoro).
 
-    async def run():
-        chunks = []
-        async for part in edge_tts.Communicate(text, VOICE).stream():
-            if part["type"] == "audio":
-                chunks.append(part["data"])
-        return b"".join(chunks)
+    POST <TTS_URL>/v1/audio/speech {"input", "voice", "response_format": "mp3"}.
+    Raises RuntimeError when TTS_URL is unset, so /tts answers 502 instead of speaking
+    through a cloud service."""
+    import urllib.request
 
-    return encode_mp3(decode_audio(asyncio.run(run())))
+    if not TTS_URL:
+        raise RuntimeError("no local TTS endpoint set (TTS_URL)")
+    body = json.dumps({"input": text, "voice": TTS_VOICE, "response_format": "mp3"}).encode()
+    headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    if TTS_API_KEY:
+        headers["Authorization"] = f"Bearer {TTS_API_KEY}"
+    req = urllib.request.Request(TTS_URL + "/v1/audio/speech", data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as res:  # non-2xx raises -> /tts answers 502
+        return encode_mp3(decode_audio(res.read()))
 
 
 # --- HTTP ---------------------------------------------------------------------------
@@ -255,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         try:
             mp3 = speak(text)
-        except Exception as e:  # network or voice service trouble
+        except Exception as e:  # local endpoint down or no TTS_URL set
             log(f"tts failed: {e!r}")
             return self.reply(502, {"error": f"speech failed: {e}"})
         log(f"tts {len(text)} chars -> {len(mp3)} B in {int((time.time() - t0) * 1000)}ms")
