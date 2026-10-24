@@ -1,5 +1,5 @@
 /*
- * Hermes on the watch: tap TALK, speak, tap STOP (stops by itself at 15 s). The recording
+ * Hermes on the watch: tap TALK, speak, tap STOP (stops by itself at 30 s). The recording
  * goes through the Zepp app on the phone to the PC (relay.js), which answers
  * with Hermes's reply, a Yes/No card for texts, emails and car commands, or a job id when
  * Hermes is slow (polled every 3 s for up to 10 min). Long answers scroll.
@@ -21,10 +21,15 @@ import { untilPhoneWakes, phoneError, resendUntil, newRid } from '../shared/retr
 import { screenFor, pollStep, resumeFor, lastIsNew } from '../shared/screens'
 import { ringDots, dotColors, elapsedText, dotsText } from '../shared/spinner'
 import { DIAG } from '../shared/debug'
+import { checkedProfile, savedScreenKey, scopedRequest } from '../shared/profiles'
 import { speechQueue } from '../shared/speechqueue'
 
 const FILE = 'clip.opus'
-const MAX_REC_MS = 15000
+const MAX_REC_MS = 30000
+// Firmware that never fires the recorder's STOP event still ends up sending: a bounded fallback
+// reads the clip after stop() has had time to finish writing it (the old fixed 400 ms race, kept
+// only for that case). The STOP event is the normal path.
+const SEND_FALLBACK_MS = 4000
 const POLL_MS = 3000
 const WAKE_MS = 30000 // keep retrying while iOS wakes the Zepp app ("shake timeout")
 // The relay answers within 12 s, so a question with no reply after ASK_ATTEMPT_MS was lost between
@@ -37,7 +42,7 @@ const POLL_LIMIT_MS = 10 * 60 * 1000
 const WAIT_BRIGHT_MS = 10 * 60 * 1000 // screen stays on while recording and waiting
 const READ_BRIGHT_MS = 60 * 1000 // then a minute to read the answer
 const MIC = 'device:os.mic'
-const SAVED = 'last-screen'
+const PROFILE_KEY = 'selected-profile'
 const VOICE_KEY = 'voice' // 'off' when the Voice button is switched off; on by default
 const LAST_TRIES = 6 // x 3 s: the relay answers or hands out a job within 12 s
 const GRANTED = 2
@@ -111,9 +116,10 @@ function textHeight(text, size) {
 Page(
   BasePage({
     state: { widgets: [], recorder: null, recording: false, busy: false, startedAt: 0, timers: [], poll: null, renderTimer: null, anim: null, waitSince: 0, resumeToken: 0,
-      voiceOn: true, player: null, playerReady: false, speechId: null, speechFile: null, earlyFiles: [], queue: null },
+      profile: 'default', profileEpoch: 0, stopToken: null, voiceOn: true, player: null, playerReady: false, speechId: null, speechFile: null, earlyFiles: [], queue: null },
 
     build() {
+      try { this.state.profile = checkedProfile(localStorage.getItem(PROFILE_KEY, 'default')) } catch (e) { this.state.profile = 'default' }
       try {
         this.state.voiceOn = localStorage.getItem(VOICE_KEY, 'on') !== 'off'
       } catch (e) {}
@@ -123,15 +129,25 @@ Page(
       } catch (e) {}
       let saved = null
       try {
-        saved = JSON.parse(localStorage.getItem(SAVED, '') || 'null')
+        saved = JSON.parse(localStorage.getItem(savedScreenKey(this.state.profile), '') || 'null')
       } catch (e) {}
       const r = resumeFor(saved, Date.now())
-      if (!r) return this.show({ screen: 'idle' })
+      if (!r || (r.show && r.show.screen !== 'confirm')) return this.listenOnOpen()
       if (r.show) {
         this.keepAwake(READ_BRIGHT_MS)
         return this.show(r.show)
       }
       this.fetchLast(r.fetchLast, r.heard)
+    },
+
+    // A button shortcut opens the app: give the page time to appear, then record.
+    // Pending approvals and unfinished requests are resumed instead of overwritten.
+    listenOnOpen() {
+      this.show({ screen: 'idle' })
+      const timer = setTimeout(() => {
+        if (!this.state.busy && !this.state.recording) this.onTalk()
+      }, 300)
+      this.state.timers.push(timer)
     },
 
     // Reopened while a question was out: collect the reply the relay kept for us.
@@ -143,7 +159,7 @@ Page(
       const token = ++this.state.resumeToken
       let tries = 0
       const attempt = () => {
-        this.request({ method: 'last' }, { timeout: 20000 }) // one try each: no 30 s phone wake-up wait here
+        this.request(scopedRequest({ method: 'last' }, this.state.profile), { timeout: 20000 }) // one try each: no 30 s phone wake-up wait here
           .catch(() => null)
           .then((last) => {
             if (token !== this.state.resumeToken) return // cancelled
@@ -192,8 +208,8 @@ Page(
     save(model) {
       if (model.screen === 'listening') return
       try {
-        if (model.screen === 'idle') return localStorage.removeItem(SAVED)
-        localStorage.setItem(SAVED, JSON.stringify({ at: Date.now(), since: this.state.waitSince, model }))
+        if (model.screen === 'idle') return localStorage.removeItem(savedScreenKey(this.state.profile))
+        localStorage.setItem(savedScreenKey(this.state.profile), JSON.stringify({ at: Date.now(), since: this.state.waitSince, model }))
       } catch (e) {}
     },
 
@@ -220,6 +236,29 @@ Page(
       return y + 80
     },
 
+    profileButtons(y) {
+      const w = Math.round(W * 0.34), gap = 12
+      const x = Math.round((W - 2 * w - gap) / 2)
+      for (const [i, profile] of ['default', 'health'].entries()) {
+        this.button(y, profile === 'health' ? 'Health' : 'Default', this.state.profile === profile ? BLUE : GREY,
+          () => this.switchProfile(profile), w, x + i * (w + gap))
+      }
+    },
+
+    switchProfile(profile) {
+      if (this.state.busy || this.state.recording || profile === this.state.profile) return
+      this.stopVoice()
+      this.clearTimers()
+      this.state.resumeToken++
+      this.state.speechId = null
+      for (const f of this.state.earlyFiles) this.deleteFile(f.path)
+      this.state.earlyFiles = []
+      this.state.profileEpoch++
+      this.state.profile = checkedProfile(profile)
+      try { localStorage.setItem(PROFILE_KEY, profile) } catch (e) {}
+      this.show({ screen: 'idle' })
+    },
+
     render(m) {
       this.stopAnim()
       for (const w of this.state.widgets) hmUI.deleteWidget(w)
@@ -227,10 +266,11 @@ Page(
       const talk = () => this.onTalk()
       let y = Math.round(H * 0.1)
       if (m.screen === 'idle') {
-        this.add(hmUI.widget.IMG, { x: Math.round((W - 124) / 2), y: Math.round(H * 0.08), src: 'icon.png' })
-        y = this.text(Math.round(H * 0.36), m.note || 'Tap TALK and ask Hermes', 26, 0xffffff)
-        y = this.button(y + 20, 'TALK', GREEN, talk)
-        this.voiceButton(y + 16, Math.round(W * 0.4), Math.round(W * 0.3))
+        y = this.text(42, 'Hermes', 30, 0xffffff)
+        this.profileButtons(102)
+        y = this.text(190, m.note || `${this.state.profile === 'health' ? 'Health' : 'Default'} — tap TALK`, 24, 0xffffff)
+        y = this.button(Math.max(y + 12, 252), 'TALK', GREEN, talk)
+        this.voiceButton(y + 12, Math.round(W * 0.4), Math.round(W * 0.3))
       } else if (m.screen === 'listening') {
         y = this.text(Math.round(H * 0.3), `Listening... ${m.seconds || 0}s`, 34, 0x7fd4ff)
         this.button(y + 30, 'STOP', 0xc0392b, talk)
@@ -253,6 +293,8 @@ Page(
         this.add(hmUI.widget.TEXT, { x: 0, y: y + 60, w: W, h: 2, text: '' }) // scroll room
       } else {
         // answer / error
+        this.profileButtons(y)
+        y += 80
         y = this.text(y + 20, m.heard, 24, 0x999999)
         y = this.text(y + 10, m.text, 32, m.screen === 'error' ? 0xff7b6b : 0xffffff)
         if (m.voiceNote) y = this.text(y + 6, m.voiceNote, 20, 0xf5b041)
@@ -339,7 +381,18 @@ Page(
         try {
           rmSync({ path: FILE })
         } catch (e) {}
-        if (!this.state.recorder) this.state.recorder = create(id.RECORDER)
+        if (!this.state.recorder) {
+          this.state.recorder = create(id.RECORDER)
+          // Official Recorder contract: event.STOP fires once when stop() has finished writing the
+          // file. Sending on it replaces reading on a fixed timer.
+          this.state.recorder.addEventListener(this.state.recorder.event.STOP, () => {
+            if (this.state.recording || !this.state.busy) return // still recording, or not our stop
+            if (this.state.stopToken === null) return // already sent for this stop (duplicate event)
+            this.state.stopToken = null
+            this.clearTimers()
+            this.send()
+          })
+        }
         this.state.recorder.setFormat(codec.OPUS, { target_file: `data://${FILE}` })
         this.state.recorder.start()
       } catch (e) {
@@ -362,14 +415,21 @@ Page(
       this.clearTimers()
       this.state.recording = false
       this.state.busy = true
+      this.state.stopToken = {} // one send per stop: the STOP event and the fallback race it
       try {
         this.state.recorder.stop()
       } catch (e) {}
       vibrate()
       this.state.waitSince = Date.now()
       this.show({ screen: 'thinking', heard: '' })
-      // Give the recorder a moment to finish writing the file.
-      this.state.timers.push(setTimeout(() => this.send(), 400))
+      // Normal path: the recorder's STOP event fires when the file is written. Fallback for
+      // firmware that omits it: read after a bounded wait instead of racing stop() by 400 ms.
+      this.state.timers.push(setTimeout(() => {
+        if (!this.state.busy || this.state.recording) return // already sent, or recording again
+        if (this.state.stopToken === null) return // the STOP event already sent it
+        this.state.stopToken = null
+        this.send()
+      }, SEND_FALLBACK_MS))
     },
 
     send() {
@@ -380,14 +440,15 @@ Page(
         return this.finish({ ok: false, error: `Could not read the recording: ${errText(e)}` })
       }
       if (!audio) return this.finish({ ok: false, error: 'Nothing was recorded. Try again.' })
-      const envelope = buildEnvelope({ kind: 'ask', speak: this.state.voiceOn, rid: newRid() }, audio)
+      const envelope = buildEnvelope({ profile: this.state.profile, kind: 'ask', speak: this.state.voiceOn, rid: newRid() }, audio)
       this.resendRequest(envelope, { contentType: 'bin', dataType: 'json' }, ASK_ATTEMPT_MS)
         .then((r) => this.finish(r))
-        .catch((e) => this.finish({ ok: false, error: phoneError(e) }))
+        .catch((e) => this.finish({ ok: false, error: phoneError(e), __profile: e.__profile, __epoch: e.__epoch }))
     },
 
     // ------------------------------------------------------------------ replies
     finish(reply) {
+      if (reply && ((reply.__profile && reply.__profile !== this.state.profile) || (reply.__epoch !== undefined && reply.__epoch !== this.state.profileEpoch))) return
       const m = screenFor(reply)
       if (m.screen === 'working') return this.startPoll(m)
       this.state.busy = false
@@ -442,6 +503,7 @@ Page(
     },
 
     playSpeech(path, params) {
+      if (params && params.profile && params.profile !== this.state.profile) { this.deleteFile(path); return }
       const pid = params && params.id
       const part = Number(params && params.part) || 1
       const skip = !this.state.voiceOn ? 'voice off' : this.state.recording ? 'recording'
@@ -525,6 +587,7 @@ Page(
     startPoll(m) {
       this.state.busy = true
       this.show(m)
+      const token = ++this.state.resumeToken
       const started = Date.now()
       let inFlight = false
       let failures = 0
@@ -536,6 +599,7 @@ Page(
         }
         inFlight = true
         const step = (r) => {
+          if (token !== this.state.resumeToken) return
           inFlight = false
           const next = pollStep(r, failures)
           if (!next.done) return (failures = next.failures)
@@ -560,18 +624,23 @@ Page(
     // phoneRequest, sent again (same request id) when an attempt gets no reply in attemptMs or the
     // phone says it couldn't reach the PC ({retry: true}); the only place lost replies are retried.
     resendRequest(req, opts, attemptMs) {
-      return resendUntil(() => this.phoneRequest(req, { ...opts, timeout: attemptMs }), { attemptMs, budgetMs: REQUEST_BUDGET_MS })
+      const profile = this.state.profile, epoch = this.state.profileEpoch
+      return resendUntil(() => epoch === this.state.profileEpoch
+        ? this.phoneRequest(req, { ...opts, timeout: attemptMs }, profile, epoch)
+        : Promise.resolve({ ok: false, error: 'Profile changed', __profile: profile, __epoch: epoch }),
+        { attemptMs, budgetMs: REQUEST_BUDGET_MS })
     },
 
     // request() to the phone, retried for up to 30 s while iOS wakes the Zepp app ("shake timeout");
     // the waiting screen says "Waking the phone" meanwhile.
-    phoneRequest(req, opts) {
+    phoneRequest(req, opts, profile = this.state.profile, epoch = this.state.profileEpoch) {
+      req = scopedRequest(req, profile)
       const done = (r) => {
         this.state.waking = false
-        return r
+        return r && typeof r === 'object' ? { ...r, __profile: profile, __epoch: epoch } : r
       }
       return untilPhoneWakes(() => this.request(req, opts), { budgetMs: WAKE_MS, onWait: () => (this.state.waking = true) })
-        .then(done, (e) => Promise.reject(done(e)))
+        .then(done, (e) => { e.__profile = profile; e.__epoch = epoch; return Promise.reject(e) })
     },
 
     newChat() {
@@ -582,8 +651,9 @@ Page(
       this.state.waitSince = Date.now()
       this.show({ screen: 'thinking', heard: 'New chat' })
       this.resendRequest({ method: 'newChat', params: { rid: newRid() } }, {}, ASK_ATTEMPT_MS)
-        .catch((e) => ({ ok: false, error: phoneError(e) }))
+        .catch((e) => ({ ok: false, error: phoneError(e), __profile: e.__profile, __epoch: e.__epoch }))
         .then((r) => {
+          if (r && r.__epoch !== undefined && r.__epoch !== this.state.profileEpoch) return
           if (!r || !r.ok) return this.finish(r)
           this.state.busy = false
           vibrate()
@@ -599,7 +669,7 @@ Page(
       this.show({ screen: 'thinking', heard: label || (yes ? 'Yes' : 'No') })
       this.resendRequest({ method: 'confirm', params: { id: confirmId, yes, speak: this.state.voiceOn, rid: newRid() } }, {}, CONFIRM_ATTEMPT_MS)
         .then((r) => this.finish(r))
-        .catch((e) => this.finish({ ok: false, error: phoneError(e) }))
+        .catch((e) => this.finish({ ok: false, error: phoneError(e), __profile: e.__profile, __epoch: e.__epoch }))
     },
   }),
 )

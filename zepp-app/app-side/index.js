@@ -22,6 +22,7 @@ import { TOKEN, RELAY } from './token'
 import { newRid, withTimeout } from '../shared/retry'
 import { onceBy } from '../shared/once'
 import { DIAG } from '../shared/debug'
+import { checkedProfile, profilePath } from '../shared/profiles'
 
 const speechJobs = new Map() // speech id -> promise of {ok, error?}: each answer is fetched and sent once
 
@@ -43,11 +44,11 @@ function parse(res) {
   }
 }
 
-async function call(method, path, payload, limitMs = ASK_MS) {
+async function call(method, path, payload, limitMs = ASK_MS, profile = 'default') {
   const t0 = Date.now()
   try {
     const res = await withTimeout(fetch({
-      url: `${RELAY}${path}`,
+      url: `${RELAY}${profilePath(profile, path)}`,
       method,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` },
       ...(payload ? { body: JSON.stringify(payload) } : {}),
@@ -69,14 +70,14 @@ async function call(method, path, payload, limitMs = ASK_MS) {
   }
 }
 
-function ask(buf) {
+function ask(buf, profile) {
   let env
   try {
     env = parseEnvelope(buf)
   } catch (e) {
     return Promise.resolve({ ok: false, error: 'The recording got garbled on the way. Try again.' })
   }
-  return call('POST', '/watch/ask', { audio_b64: base64(env.audio), rid: env.header.rid || newRid(), speak: !!env.header.speak })
+  return call('POST', '/watch/ask', { audio_b64: base64(env.audio), rid: env.header.rid || newRid(), speak: !!env.header.speak }, ASK_MS, profile)
 }
 
 // Short status lines into the relay log (POST /watch/diag), because this side service's own
@@ -97,7 +98,7 @@ let speechSlot = 0
 
 // Spoken answer: download the MP3 from the relay, then send it to the watch (zml file transfer).
 // Resolves when the watch has it, so a failure can be shown on the watch.
-function sendSpeech(svc, id, trigger, part = 1, parts = 1) {
+function sendSpeech(svc, id, trigger, part = 1, parts = 1, profile = 'default') {
   const t0 = Date.now()
   const step = (what) => diag('phone', `speech ${id}.${part}: ${what} (+${Date.now() - t0} ms)`)
   step(`start (${trigger})`)
@@ -119,7 +120,7 @@ function sendSpeech(svc, id, trigger, part = 1, parts = 1) {
     }, 90000)
     const start = (file, fallback) => {
       try {
-        task = svc.download(`${RELAY}/watch/speech?id=${encodeURIComponent(id)}&part=${part}`,
+        task = svc.download(`${RELAY}${profilePath(profile, '/watch/speech')}?id=${encodeURIComponent(id)}&part=${part}`,
           { timeout: 40000, headers: { Authorization: `Bearer ${TOKEN}` }, filePath: file })
       } catch (e) {
         return fallback ? start(fallback) : done({ ok: false, error: `Voice download didn't start: ${errText(e)}` })
@@ -137,7 +138,7 @@ function sendSpeech(svc, id, trigger, part = 1, parts = 1) {
         step(`downloaded, HTTP ${ev.statusCode}`)
         if (ev.statusCode !== 200) return done({ ok: false, error: `Voice: the PC answered ${ev.statusCode}.` })
         try {
-          const sent = svc.sendFile(ev.filePath || ev.tempFilePath || file, { type: 'speech', id, part, parts })
+          const sent = svc.sendFile(ev.filePath || ev.tempFilePath || file, { type: 'speech', id, part, parts, profile })
           step('handed to Bluetooth')
           sent.on('change', (e) => {
             const state = e && e.data && e.data.readyState
@@ -157,10 +158,10 @@ function sendSpeech(svc, id, trigger, part = 1, parts = 1) {
 
 // All of an answer's clips, in order: clip 1 (the first sentence) goes first so it isn't stuck
 // behind the bigger clip 2 on Bluetooth. Reports the first failure, if any.
-async function sendSpeechClips(svc, id, parts, trigger) {
+async function sendSpeechClips(svc, id, parts, trigger, profile) {
   let first = null
   for (let part = 1; part <= parts; part++) {
-    const r = await sendSpeech(svc, id, trigger, part, parts)
+    const r = await sendSpeech(svc, id, trigger, part, parts, profile)
     if (!r.ok && !first) first = r
   }
   return first || { ok: true, sent: true }
@@ -174,23 +175,26 @@ AppSideService(
     onRequest(req, res) {
       const isBinary = req instanceof ArrayBuffer || (req && req.byteLength !== undefined && !req.method)
       const p = req && req.params ? req.params : {}
+      let profile
+      try { profile = checkedProfile(isBinary ? parseEnvelope(req).header.profile : p.profile) }
+      catch (e) { res(null, { ok: false, error: 'Invalid watch profile' }); return }
       let work
-      if (isBinary) work = ask(req)
+      if (isBinary) work = ask(req, profile)
       else if (req.method === 'confirm') {
-        work = call('POST', '/watch/confirm', { id: p.id, yes: !!p.yes, rid: p.rid || newRid(), speak: !!p.speak }, CONFIRM_MS)
+        work = call('POST', '/watch/confirm', { id: p.id, yes: !!p.yes, rid: p.rid || newRid(), speak: !!p.speak }, CONFIRM_MS, profile)
       }
-      else if (req.method === 'result') work = call('POST', '/watch/result', { job: p.job || '', speak: !!p.speak }, POLL_MS)
-      else if (req.method === 'speech') work = onceBy(speechJobs, String(p.id || ''), () => sendSpeechClips(this, String(p.id || ''), Number(p.parts) || 1, 'watch asked'))
+      else if (req.method === 'result') work = call('POST', '/watch/result', { job: p.job || '', speak: !!p.speak }, POLL_MS, profile)
+      else if (req.method === 'speech') work = onceBy(speechJobs, `${profile}:${p.id || ''}`, () => sendSpeechClips(this, String(p.id || ''), Number(p.parts) || 1, 'watch asked', profile))
       else if (req.method === 'diag') {
         diag('watch', ...(Array.isArray(p.events) ? p.events : []))
         work = Promise.resolve({ ok: true })
       }
-      else if (req.method === 'last') work = call('GET', '/watch/last', null, POLL_MS)
-      else if (req.method === 'newChat') work = call('POST', '/watch/ask', { text: 'start new session', rid: p.rid || newRid() })
+      else if (req.method === 'last') work = call('GET', '/watch/last', null, POLL_MS, profile)
+      else if (req.method === 'newChat') work = call('POST', '/watch/ask', { text: 'start new session', rid: p.rid || newRid() }, ASK_MS, profile)
       else work = Promise.resolve({ ok: false, error: `unknown request ${req.method}` })
       work.then((r) => {
         res(null, r) // the text goes to the watch first...
-        if (r && r.speech) onceBy(speechJobs, r.speech, () => sendSpeechClips(this, r.speech, r.speechParts || 1, `reply to ${req.method || 'ask'}`)) // ...then its audio follows
+        if (r && r.speech) onceBy(speechJobs, `${profile}:${r.speech}`, () => sendSpeechClips(this, r.speech, r.speechParts || 1, `reply to ${req.method || 'ask'}`, profile)) // ...then its audio follows
       }).catch((e) => res(null, { ok: false, error: errText(e) }))
     },
   }),

@@ -27,6 +27,7 @@ async function setup(t, opts = {}) {
     pcHealth: async () => opts.health || '{}',
     cancelRestart: () => 'PC restart cancelled.',
     runAction: async (a) => { ran.push(a); return { ok: true, message: `Sent to ${a.contact}.` }; },
+    agentActionsEnabled: !!opts.agentActionsEnabled,
     actionsEnabled: opts.actionsEnabled === undefined ? true : !!opts.actionsEnabled,
     notifyEnabled: opts.notifyEnabled === undefined ? true : !!opts.notifyEnabled,
     log: line => logged.push(line),
@@ -524,4 +525,21 @@ test('full behaviour (default): the email and Claude Code rules are still sent t
   await ask({ text: 'read my emails' });
   assert.match(hermes.calls[0].user, /Never call send_text/);
   assert.match(hermes.calls[0].user, /gmail_mark_read FIRST/); // the email rule rides on "read ... emails"
+});
+
+
+test('agent control forwards requested email actions and preserves normal approvals', async t => {
+  const { ask, confirm, hermes, ran, notified } = await setup(t, { agentActionsEnabled: true, actionsEnabled: false, notifyEnabled: false });
+  await ask({ text: 'send an email to Ann saying hello' });
+  assert.equal(hermes.calls[0].user, 'send an email to Ann saying hello');
+  assert.match(hermes.calls[0].system, /including sending email when asked/);
+  assert.doesNotMatch(hermes.calls[0].system, /no direct actions|informational response only/);
+  const card = await ask({ text: 'build a test task' });
+  assert.equal(card.approve, true);
+  await confirm({ id: card.id, yes: true });
+  assert.equal(hermes.approvals[0].choice, 'once');
+  assert.equal(ran.length, 0);
+  assert.equal(notified.length, 0);
+  assert.equal((await ask({ text: 'PC health check' })).text, 'echo: PC health check');
+  assert.equal((await ask({ text: 'cancel pc restart' })).text, 'echo: cancel pc restart');
 });

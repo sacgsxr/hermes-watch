@@ -2,6 +2,7 @@
 config.json
 zepp-app/app-side/token.js
 session.json
+session-health.json
 turns.jsonl
 *.log
 .env
@@ -9,5 +10,6 @@ turns.jsonl
 # Build output and dependencies
 node_modules/
 zepp-app/dist/
+zepp-app/.remote-builds/
 stt/.venv/
 __pycache__/

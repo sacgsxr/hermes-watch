@@ -32,6 +32,7 @@ const { watchSystemPrompt, withWatchRules, splitConfirm, WATCH_CHAR_BUDGET } = r
 // The safe slice: the relay asks the already-running Hermes profile and shows its answers;
 // it never sends texts or touches the car or PC itself (relay-only shortcuts like "new session"
 // and the read-only PC health check stay). createServer keeps the full behaviour for tests.
+const AGENT_ACTION_RULE = 'Use the selected Hermes profile and its available tools to carry out the user\'s explicit requests, including sending email when asked. Honor the profile\'s normal approval requirements. Do not claim an action succeeded until its tool result confirms success.';
 const NO_ACTION_RULE = 'This watch build has no direct actions: do not propose sending texts, emails or car commands.';
 function promptWithRules(text, rules) {
   if (!rules || !rules.length) return text;
@@ -73,14 +74,27 @@ function createServer(opts) {
   const tts = opts.tts || ((text) => postTts(new URL('/tts', opts.sttUrl), text));
   const notify = opts.notify || (() => {});
   const actionsEnabled = !!opts.actionsEnabled;
+  const agentActionsEnabled = !!opts.agentActionsEnabled;
   const notifyEnabled = !!opts.notifyEnabled;
   // Prompt rules for this build: the full watch rules when actions are enabled (the default,
   // as in tests), or just "no direct actions" for the safe slice.
   const systemPrompt = opts.systemPrompt !== undefined ? opts.systemPrompt
-    : (actionsEnabled ? watchSystemPrompt : safeSystemPrompt);
-  const turnRules = opts.turnRules || ((text) => actionsEnabled ? withWatchRules(text)
+    : (agentActionsEnabled ? () => safeSystemPrompt().replace(NO_ACTION_RULE, AGENT_ACTION_RULE) : actionsEnabled ? watchSystemPrompt : safeSystemPrompt);
+  const turnRules = opts.turnRules || ((text) => agentActionsEnabled ? text : actionsEnabled ? withWatchRules(text)
     : promptWithRules(text, [NO_ACTION_RULE]));
   const jobs = new Map();
+  const ownedPending = new Map();
+  function createPending(action) {
+    for (const [id, at] of ownedPending) if (Date.now() - at > actions.CONFIRM_TTL_MS) ownedPending.delete(id);
+    const id = actions.createPending(action);
+    ownedPending.set(id, Date.now());
+    return id;
+  }
+  function takePending(id) {
+    if (!ownedPending.has(id)) return null;
+    ownedPending.delete(id);
+    return actions.takePending(id);
+  }
 
   let session = readJson(opts.sessionFile);
   function currentSession() {
@@ -115,7 +129,7 @@ function createServer(opts) {
       const body = Buffer.from(JSON.stringify({ model: 'hermes-agent', stream: true, messages: [
         { role: 'system', content: systemPrompt() },
         { role: 'user', content: turnRules(userText) }] }));
-      up = http.request({ host: '127.0.0.1', port: opts.hermesPort, method: 'POST', path: '/v1/chat/completions', headers: {
+      up = http.request({ host: '127.0.0.1', port: opts.hermesPort, method: 'POST', path: `${opts.hermesPathPrefix || ''}/v1/chat/completions`, headers: {
         authorization: `Bearer ${opts.hermesKey}`, 'content-type': 'application/json', 'content-length': body.length,
         'x-hermes-session-id': sessionId } }, (res) => {
         let buf = '';
@@ -153,7 +167,7 @@ function createServer(opts) {
     return new Promise((resolve) => {
       const body = Buffer.from(JSON.stringify({ choice, request_id: requestId }));
       const req = http.request({ host: '127.0.0.1', port: opts.hermesPort, method: 'POST',
-        path: `/v1/runs/${encodeURIComponent(runId)}/approval`, headers: {
+        path: `${opts.hermesPathPrefix || ''}/v1/runs/${encodeURIComponent(runId)}/approval`, headers: {
           authorization: `Bearer ${opts.hermesKey}`, 'content-type': 'application/json', 'content-length': body.length } }, (res) => {
         res.resume();
         res.on('end', () => resolve(res.statusCode));
@@ -178,7 +192,7 @@ function createServer(opts) {
     const { text, confirm } = splitConfirm(r.text);
     const body = truncateForHud(formatForHud(text), WATCH_CHAR_BUDGET);
     if (!confirm) return { ok: true, heard, kind: 'answer', text: body };
-    const id = actions.createPending({ kind: 'hermes', question: confirm });
+    const id = createPending({ kind: 'hermes', question: confirm });
     return { ok: true, heard, kind: 'confirm', text: body ? `${body}\n${confirm}` : confirm, id };
   }
 
@@ -293,12 +307,12 @@ function createServer(opts) {
       session = { id: newSessionId() };
       return answered(heard, { ok: true, heard, kind: 'answer', text: 'New session started.' });
     }
-    if (parsePcRestartCommand(heard) === 'cancel') {
+    if (!agentActionsEnabled && parsePcRestartCommand(heard) === 'cancel') {
       const text = cancelRestart();
       log(`  pc restart cancel: ${text}`);
       return answered(heard, { ok: true, heard, kind: 'answer', text });
     }
-    if (isPcHealthRequest(heard) || MISHEARD_HEALTH.test(heard)) {
+    if (!agentActionsEnabled && (isPcHealthRequest(heard) || MISHEARD_HEALTH.test(heard))) {
       const text = formatPcHealth(await pcHealth()); // not gathered -> Hermes answers instead
       if (text) {
         log(`  -> pc health ${Date.now() - started}ms`);
@@ -309,7 +323,7 @@ function createServer(opts) {
     // Hermes like any other question.
     const action = actionsEnabled ? actions.parseAction(heard) : null;
     if (action) {
-      const id = actions.createPending(action);
+      const id = createPending(action);
       log(`  -> confirm ${action.kind}${action.tool ? ` ${action.tool}` : ''}`);
       return answered(heard, { ok: true, heard, kind: 'confirm', text: action.summary, id });
     }
@@ -320,7 +334,7 @@ function createServer(opts) {
   async function confirm(body) {
     const pendingApproval = approvals.get(String(body.id || ''));
     if (pendingApproval) return approve({ id: String(body.id), ...pendingApproval }, !!body.yes);
-    const action = actions.takePending(String(body.id || ''));
+    const action = takePending(String(body.id || ''));
     if (!action) return { ok: true, kind: 'answer', text: 'That expired, ask again.' };
     if (action.kind === 'hermes' && !body.yes) {
       // Nothing to wait for on a No (Hermes once took 3+ min to reply to it): answer now and
@@ -421,7 +435,7 @@ function createServer(opts) {
     if (!['/watch/ask', '/watch/confirm', '/watch/diag'].includes(url.pathname)) log(`${req.method} ${url.pathname}${url.search}`);
     if (req.method === 'GET' && url.pathname === '/health') {
       const stt = new URL(opts.sttUrl);
-      return Promise.all([probe(stt.hostname, stt.port, '/health'), probe('127.0.0.1', opts.hermesPort, '/health')])
+      return Promise.all([probe(stt.hostname, stt.port, '/health'), probe('127.0.0.1', opts.hermesPort, `${opts.hermesPathPrefix || ''}/health`)])
         .then(([sttOk, hermesOk]) => send(200, { ok: true, stt: sttOk, hermes: hermesOk }));
     }
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -577,11 +591,11 @@ if (require.main === module) {
   };
   if (!config.token) { console.error('config.json needs a "token" (see config.example.json)'); process.exit(1); }
   if (!hermesKey) { console.error(`API_SERVER_KEY not found in ${envFile}`); process.exit(1); }
-  // Safe defaults: no direct actions, no Telegram; opt in with WATCH_ACTIONS=1 / WATCH_NOTIFY=1.
+  // Normal Hermes tools handle user requests. Legacy relay shortcuts and Telegram delivery remain optional.
   const actionsEnabled = process.env.WATCH_ACTIONS === '1';
   const notifyEnabled = process.env.WATCH_NOTIFY === '1';
   const port = Number(process.env.WATCH_PORT) || 8798;
-  createServer({
+  const defaultOptions = {
     token: config.token,
     hermesKey,
     hermesPort: Number(process.env.WATCH_HERMES_PORT) || 8643,
@@ -589,10 +603,32 @@ if (require.main === module) {
     sessionFile: process.env.WATCH_SESSION_FILE || path.join(__dirname, 'session.json'),
     deadlineMs: Number(process.env.WATCH_DEADLINE_MS) || DEFAULT_DEADLINE_MS,
     actionsEnabled,
+    agentActionsEnabled: process.env.WATCH_AGENT_ACTIONS !== '0',
     notifyEnabled,
     log,
     recordTurn: e => fs.appendFile(process.env.WATCH_TURNS_FILE || path.join(__dirname, 'turns.jsonl'),
       `${JSON.stringify(e)}\n`, () => {}),
     notify: notifyEnabled ? notify : () => {},
-  }).listen(port, '127.0.0.1', () => log(`watch relay listening on 127.0.0.1:${port}`));
+  };
+  const healthHome = process.env.WATCH_HEALTH_HOME || path.join(path.dirname(envFile), 'profiles', 'health');
+  let healthKey = '';
+  try {
+    const text = fs.readFileSync(path.join(healthHome, '.env'), 'utf8');
+    const match = text.match(/^\s*API_SERVER_KEY\s*=\s*(.+)$/m);
+    healthKey = match ? match[1].trim().replace(/^["']|["']$/g, '') : '';
+  } catch { /* Health must fail closed; never reuse the default profile key. */ }
+  const healthOptions = {
+    ...defaultOptions,
+    hermesKey: healthKey,
+    hermesPathPrefix: '/p/health',
+    sessionFile: path.join(__dirname, 'session-health.json'),
+    actionsEnabled: false,
+    notifyEnabled: false,
+    notify: () => {},
+    log: line => fs.appendFile(path.join(__dirname, 'relay-health.log'), `${new Date().toISOString()} ${line}\n`, { mode: 0o600 }, () => {}),
+    recordTurn: e => fs.appendFile(path.join(__dirname, 'turns-health.jsonl'), `${JSON.stringify(e)}\n`, { mode: 0o600 }, () => {}),
+  };
+  const { createProfileServer } = require('./lib/profile-router');
+  createProfileServer(createServer, { default: defaultOptions, health: healthOptions })
+    .listen(port, '127.0.0.1', () => log(`watch relay listening on 127.0.0.1:${port}; profiles=default,health`));
 }
