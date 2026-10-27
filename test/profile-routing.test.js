@@ -19,7 +19,7 @@ test('Default and Health isolate API credentials, sessions, retry IDs, last repl
       const body = JSON.parse(data);
       received.push({ profile, url: req.url, session: req.headers['x-hermes-session-id'] });
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-      res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: body.messages[1].content === 'draft email' ? 'Draft ready.\nCONFIRM: Send this email?' : profile + ':' + body.messages[1].content } }] })}\n\ndata: [DONE]\n\n`);
+      res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: body.messages[1].content.split('\n')[0] === 'draft email' ? 'Draft ready.\nCONFIRM: Send this email?' : profile + ':' + body.messages[1].content.split('\n')[0] } }] })}\n\ndata: [DONE]\n\n`);
     });
   });
   const port = await listen(upstream);
@@ -41,6 +41,7 @@ test('Default and Health isolate API credentials, sessions, retry IDs, last repl
   };
   assert.equal((await call('/p/health/watch/last', null, false)).status, 401);
   assert.equal((await call('/p/unknown/watch/ask', { text: 'private' })).status, 404);
+  assert.equal((await call('/p/health/watch/stop', { job: 'unknown' }, false)).status, 401);
   const d = await call('/watch/ask', { text: 'everyday', rid: 'same-rid', speak: true });
   const h = await call('/p/health/watch/ask', { text: 'private-health', rid: 'same-rid', speak: true });
   assert.equal(d.body.text, 'default:everyday');
@@ -63,4 +64,33 @@ test('Default and Health isolate API credentials, sessions, retry IDs, last repl
   const beforeReset = (await call('/p/default/watch/last')).body.text;
   await call('/p/health/watch/ask', { text: 'start new session', rid: 'health-reset' });
   assert.equal((await call('/p/default/watch/last')).body.text, beforeReset);
+});
+
+
+test('Stop is confined to the same profile even when request IDs match', async t => {
+  const upstream = http.createServer((req, res) => {
+    if (req.url.endsWith('/stop')) { res.writeHead(200); return res.end('{}'); }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write('data: {"id":"test-run","choices":[{"delta":{"role":"assistant"}}]}\n\n');
+    const timer = setTimeout(() => res.end('data: [DONE]\n\n'), 5000);
+    res.on('close', () => clearTimeout(timer));
+  });
+  const port = await listen(upstream);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-stop-profiles-'));
+  const common = { token: 'watch-token', hermesKey: 'key', hermesPort: port, sttUrl: 'http://127.0.0.1:1/stt', deadlineMs: 20 };
+  const server = createProfileServer(createServer, {
+    default: { ...common, sessionFile: path.join(dir, 'default.json') },
+    health: { ...common, hermesPathPrefix: '/p/health', sessionFile: path.join(dir, 'health.json') },
+  });
+  const relayPort = await listen(server);
+  t.after(() => { server.close(); server.closeAllConnections(); upstream.close(); upstream.closeAllConnections(); });
+  const post = async (profile, endpoint, body) => (await fetch(`http://127.0.0.1:${relayPort}/p/${profile}/watch/${endpoint}`, {
+    method: 'POST', headers: { Authorization: 'Bearer watch-token', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })).json();
+  const h = await post('health', 'ask', { text: 'hold Health', rid: 'same' });
+  const d = await post('default', 'ask', { text: 'hold Default', rid: 'same' });
+  assert.equal((await post('default', 'stop', { job: h.job })).ok, false);
+  await post('health', 'stop', { job: h.job });
+  assert.equal((await post('default', 'result', { job: d.job })).kind, 'working');
+  await post('default', 'stop', { job: d.job });
 });

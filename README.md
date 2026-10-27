@@ -6,6 +6,20 @@ changes Hermes hands to Claude Code.
 
 Built for the Amazfit Active 2 (Zepp OS); other round Zepp OS 4 watches should need only small changes.
 
+## Personal deployment update: 1.2.0
+
+- Opens the UI with the selected Default/Health profile visible; recording starts only after TALK. No new hardware double-click binding.
+- Working replies include bounded tool-stage progress and elapsed time; raw arguments and model reasoning are not displayed.
+- Stop targets the current request/job, including uploads that have not reached Hermes. It uses Hermes native run control to interrupt the exact worker; merely closing a chat stream is insufficient on the current gateway. Actions already completed are retained. Closing the app still lets work continue in the background.
+- Health food-logging instructions verify portion-count semantics, count/total weight, actual recipe provenance and diary read-back; estimates must remain labeled. These are agent instructions, not a guarantee against model errors.
+- System instructions remain stable; current local date/time travels with each new user turn for prompt-cache reuse.
+
+The server update is compatible with the older watch app. Progress, true Stop, and UI-first launch need the 1.2.0 watch package.
+
+Health instruction template: [docs/health-food-logging.md](docs/health-food-logging.md).
+
+**Installation packages:** use `zeus preview` for Developer Mode installation. Uploading a production `zeus build` bundle through a preview uploader does not convert it. Before upload, verify `packageInfo.mode` is `preview` in both the device and app-side `app.json` inside the generated bundle. Production bundles are rejected by the preview installer.
+
 ## What it does
 
 - **Voice in, text and voice out.** The watch records Opus audio; your PC transcribes it with Whisper and asks
@@ -97,6 +111,7 @@ Run the PC parts as scheduled tasks if you want them to start with Windows.
 All but `/health` need `Authorization: Bearer <token>`.
 
 - `POST /watch/ask` `{audio_b64}` or `{text}` -> `{ok, heard, kind: answer|confirm|working, text, id?, job?, approve?}`
+- `POST /watch/stop` `{job}` or `{rid}` -> scoped stop request; completed writes are not undone
 - `POST /watch/confirm` `{id, yes}` -> the next reply (Yes/No cards last 60 s, Approve cards ~5 min)
 - `GET /watch/result?job=` -> `{kind: working}` until a slow answer (or the next Approve card) is ready
 - `GET /watch/last` -> the latest reply plus `ago_ms`, for a watch that closed mid-question

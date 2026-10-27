@@ -4,6 +4,7 @@ zepp-app/app-side/token.js
 session.json
 session-health.json
 turns.jsonl
+turns-health.jsonl
 *.log
 .env
 

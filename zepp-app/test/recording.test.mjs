@@ -169,3 +169,55 @@ for (const [screen, note] of [['idle', 'starts listening on open'], ['answer', '
     assert.equal(page.state.recorder, null)
   })
 }
+
+
+test('explicit Stop targets the active job and fences a late original response', async () => {
+  const { page } = loadPage();
+  page.state.busy = true;
+  page.state.pendingRid = 'r1';
+  page.model = { screen: 'working', job: 'j1', rid: 'r1' };
+  let resolveOld;
+  const calls = [];
+  page.phoneRequest = req => {
+    calls.push(req);
+    if (req.method === 'stop') return Promise.resolve({ ok: true, kind: 'answer', text: 'Stop requested.', stopped: true });
+    return new Promise(resolve => { resolveOld = resolve; });
+  };
+  const old = page.resendRequest({ method: 'confirm', params: { rid: 'r1' } }, {}, 25000);
+  await tick();
+  await page.stopRequest();
+  assert.equal(calls[1].method, 'stop');
+  assert.equal(calls[1].params.job, 'j1');
+  assert.equal(calls[1].params.rid, 'r1');
+  assert.equal(page.model.text, 'Stop requested.');
+  resolveOld({ ok: true, kind: 'answer', text: 'stale original reply' });
+  page.finish(await old);
+  assert.equal(page.model.text, 'Stop requested.');
+  assert.equal(page.state.busy, false);
+});
+
+test('progress polling updates the visible stage while preserving the request', async () => {
+  const { page, scheduled } = loadPage();
+  page.phoneRequest = () => Promise.resolve({ ok: true, kind: 'working', progress: 'Checking food entry' });
+  page.startPoll({ screen: 'working', job: 'j1', rid: 'r1', progress: 'Starting model' });
+  scheduled[scheduled.length - 1]();
+  await tick();
+  assert.equal(page.state.progress, 'Checking food entry');
+  assert.equal(page.model.progress, 'Checking food entry');
+  assert.equal(page.model.job, 'j1');
+  assert.equal(page.state.busy, true);
+});
+
+
+test('failed Stop keeps the target available rather than claiming cancellation', async () => {
+  const { page } = loadPage();
+  page.model = { screen: 'working', job: 'j1', rid: 'r1' };
+  page.state.busy = true;
+  page.state.pendingRid = 'r1';
+  page.phoneRequest = () => Promise.resolve({ ok: false, error: 'Phone unavailable' });
+  await page.stopRequest();
+  assert.equal(page.model.job, 'j1');
+  assert.equal(page.model.progress, 'Stop not confirmed');
+  assert.equal(page.state.busy, true);
+  assert.equal(page.state.stopping, false);
+});

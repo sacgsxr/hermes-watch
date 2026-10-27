@@ -11,7 +11,7 @@ export function screenFor(reply) {
     return { screen: 'confirm', heard, text: reply.text, id: reply.id, ...(reply.approve ? { approve: true } : {}), ...speech }
   }
   if (reply.kind === 'working') {
-    return { screen: 'working', heard, text: 'Still working on it...', job: reply.job, ...(reply.note ? { note: reply.note } : {}) }
+    return { screen: 'working', heard, text: 'Still working on it...', job: reply.job, ...(reply.rid ? { rid: reply.rid } : {}), ...(reply.progress ? { progress: reply.progress } : {}), ...(reply.note ? { note: reply.note } : {}) }
   }
   return { screen: 'answer', heard, text: reply.text || '', ...speech }
 }

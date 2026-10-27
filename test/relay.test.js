@@ -27,6 +27,7 @@ async function setup(t, opts = {}) {
     pcHealth: async () => opts.health || '{}',
     cancelRestart: () => 'PC restart cancelled.',
     runAction: async (a) => { ran.push(a); return { ok: true, message: `Sent to ${a.contact}.` }; },
+    now: opts.now,
     agentActionsEnabled: !!opts.agentActionsEnabled,
     actionsEnabled: opts.actionsEnabled === undefined ? true : !!opts.actionsEnabled,
     notifyEnabled: opts.notifyEnabled === undefined ? true : !!opts.notifyEnabled,
@@ -531,7 +532,7 @@ test('full behaviour (default): the email and Claude Code rules are still sent t
 test('agent control forwards requested email actions and preserves normal approvals', async t => {
   const { ask, confirm, hermes, ran, notified } = await setup(t, { agentActionsEnabled: true, actionsEnabled: false, notifyEnabled: false });
   await ask({ text: 'send an email to Ann saying hello' });
-  assert.equal(hermes.calls[0].user, 'send an email to Ann saying hello');
+  assert.equal(hermes.calls[0].user.split('\n')[0], 'send an email to Ann saying hello');
   assert.match(hermes.calls[0].system, /including sending email when asked/);
   assert.doesNotMatch(hermes.calls[0].system, /no direct actions|informational response only/);
   const card = await ask({ text: 'build a test task' });
@@ -542,4 +543,79 @@ test('agent control forwards requested email actions and preserves normal approv
   assert.equal(notified.length, 0);
   assert.equal((await ask({ text: 'PC health check' })).text, 'echo: PC health check');
   assert.equal((await ask({ text: 'cancel pc restart' })).text, 'echo: cancel pc restart');
+});
+
+
+test('watch clocks cross midnight without changing the system prefix or session', async (t) => {
+  // Every time zone crosses a date boundary in this interval.
+  for (const mode of [{ agentActionsEnabled: true, actionsEnabled: false },
+    { agentActionsEnabled: false, actionsEnabled: false },
+    { agentActionsEnabled: false, actionsEnabled: true }]) {
+    let now = new Date('2026-10-26T23:59:00Z');
+    const { ask, hermes } = await setup(t, { ...mode, now: () => now });
+    await ask({ text: 'log my snack today' });
+    now = new Date('2026-10-28T00:01:00Z');
+    await ask({ text: 'what about today' });
+    assert.equal(hermes.calls.length, 2);
+    const [first, second] = hermes.calls;
+    assert.equal(first.system, second.system);
+    assert.doesNotMatch(first.system, /Current date and time:/);
+    assert.equal(first.session, second.session);
+    assert.equal(first.user.split('\n')[0], 'log my snack today');
+    assert.equal(second.user.split('\n')[0], 'what about today');
+    const { timeString } = require('../lib/voice-common');
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    assert.ok(first.user.includes(timeString(zone, zone, new Date('2026-10-26T23:59:00Z'))));
+    assert.ok(second.user.includes(timeString(zone, zone, now)));
+    assert.notEqual(first.user.match(/\[Watch request context:.*\]/)[0], second.user.match(/\[Watch request context:.*\]/)[0]);
+  }
+});
+
+
+test('working replies expose safe tool progress without raw arguments', async t => {
+  const { ask, call } = await setup(t, { deadlineMs: 25 });
+  const r = await ask({ text: 'progress slow', rid: 'progress-one' });
+  assert.equal(r.kind, 'working');
+  assert.equal(r.rid, 'progress-one');
+  assert.equal(r.progress, 'Saving food entry');
+  assert.ok(r.elapsed_ms >= 0);
+  assert.doesNotMatch(JSON.stringify(r), /private food/);
+  assert.equal((await call('POST', '/watch/result', { job: r.job })).json.progress, 'Saving food entry');
+  await call('POST', '/watch/stop', { job: r.job });
+});
+
+test('Stop interrupts the exact stream and remains stopped on retries', async t => {
+  const { ask, call, hermes } = await setup(t, { deadlineMs: 25 });
+  const pending = await ask({ text: 'slow request', rid: 'stop-one' });
+  assert.equal(pending.kind, 'working');
+  assert.equal((await call('POST', '/watch/stop', { job: pending.job }, 'wrong')).status, 401);
+  const stopped = (await call('POST', '/watch/stop', { job: pending.job })).json;
+  assert.equal(stopped.stopped, true);
+  assert.match(stopped.text, /already saved/);
+  await sleep(60);
+  assert.equal(hermes.stops.length, 1);
+  assert.equal(hermes.stops[0].auth, 'Bearer hermes-key');
+  assert.equal(hermes.closed.length, 1);
+  assert.equal((await call('POST', '/watch/result', { job: pending.job })).json.stopped, true);
+  await call('POST', '/watch/stop', { job: pending.job });
+  assert.equal(hermes.stops.length, 1);
+  await ask({ text: 'slow request', rid: 'stop-one' });
+  assert.equal(hermes.calls.length, 1);
+});
+
+test('Stop arriving before audio upload fences its later request', async t => {
+  const { ask, call, hermes } = await setup(t);
+  assert.equal((await call('POST', '/watch/stop', { rid: 'cancel-upload' })).json.stopped, true);
+  const r = await ask({ audio_b64: Buffer.from('do not run me').toString('base64'), rid: 'cancel-upload' });
+  assert.equal(r.stopped, true);
+  assert.equal(hermes.calls.length, 0);
+});
+
+test('Stop on a completed request returns its result without pretending to undo it', async t => {
+  const { ask, call, hermes } = await setup(t);
+  await ask({ text: 'finished', rid: 'completed-one' });
+  const r = (await call('POST', '/watch/stop', { rid: 'completed-one' })).json;
+  assert.equal(r.already_finished, true);
+  assert.equal(r.text, 'echo: finished');
+  assert.equal(hermes.stops.length, 0);
 });

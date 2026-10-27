@@ -15,6 +15,8 @@ const sse = (event, data) => `${event ? `event: ${event}\n` : ''}data: ${typeof 
 async function fakeHermes() {
   const calls = [];
   const approvals = [];
+  const stops = [];
+  const closed = [];
   const waiting = new Map(); // run id -> resolve(choice)
   let runs = 0;
   const server = http.createServer((req, res) => {
@@ -23,6 +25,8 @@ async function fakeHermes() {
     req.on('end', () => {
       if (req.method === 'GET') { res.writeHead(200); return res.end('{}'); }
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const stop = req.url.match(/\/v1\/runs\/([^/]+)\/stop$/);
+      if (stop) { stops.push({ run: stop[1], auth: req.headers.authorization }); res.writeHead(200); return res.end(JSON.stringify({ status: 'stopping' })); }
       const approval = req.url.match(/^\/v1\/runs\/([^/]+)\/approval$/);
       if (approval) {
         approvals.push({ run: approval[1], ...body, auth: req.headers.authorization });
@@ -38,12 +42,13 @@ async function fakeHermes() {
       calls.push({ session: req.headers['x-hermes-session-id'], auth: req.headers.authorization, user,
         system: body.messages[0].content, stream: body.stream });
       const run = `run-${++runs}`;
+      res.on('close', () => { if (!res.writableEnded) closed.push(run); });
       let content = `echo: ${first}`;
       if (/draft/.test(first)) content = 'Draft to Ann: Hi\nCONFIRM: Send this email?';
       if (/long/.test(first)) content = 'word '.repeat(600);
       if (body.stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-        res.write(sse('', { choices: [{ delta: { role: 'assistant' } }] }));
+        res.write(sse('', { id: run, choices: [{ delta: { role: 'assistant' } }] }));
       }
       const send = (text) => {
         if (!body.stream) {
@@ -70,11 +75,12 @@ async function fakeHermes() {
         })();
         return;
       }
-      if (/slow|^no, don't/.test(first)) setTimeout(() => send(content), 2000); else send(content);
+      if (/progress/.test(first)) res.write(sse('hermes.tool.progress', { tool: 'mcp__nutritrace__log_food', status: 'running', label: 'private food contents' }));
+      if (/slow|^no, don't/.test(first)) { const timer = setTimeout(() => send(content), 2000); res.on('close', () => clearTimeout(timer)); } else send(content);
     });
   });
   const port = await listen(server);
-  return { port, calls, approvals, close: () => server.close() };
+  return { port, calls, approvals, stops, closed, close: () => server.close() };
 }
 
 async function fakeStt() {

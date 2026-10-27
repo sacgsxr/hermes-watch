@@ -116,7 +116,7 @@ function textHeight(text, size) {
 Page(
   BasePage({
     state: { widgets: [], recorder: null, recording: false, busy: false, startedAt: 0, timers: [], poll: null, renderTimer: null, anim: null, waitSince: 0, resumeToken: 0,
-      profile: 'default', profileEpoch: 0, stopToken: null, voiceOn: true, player: null, playerReady: false, speechId: null, speechFile: null, earlyFiles: [], queue: null },
+      profile: 'default', profileEpoch: 0, stopToken: null, voiceOn: true, player: null, playerReady: false, speechId: null, speechFile: null, earlyFiles: [], queue: null, pendingRid: null, progress: '', stopping: false },
 
     build() {
       try { this.state.profile = checkedProfile(localStorage.getItem(PROFILE_KEY, 'default')) } catch (e) { this.state.profile = 'default' }
@@ -132,22 +132,13 @@ Page(
         saved = JSON.parse(localStorage.getItem(savedScreenKey(this.state.profile), '') || 'null')
       } catch (e) {}
       const r = resumeFor(saved, Date.now())
-      if (!r || (r.show && r.show.screen !== 'confirm')) return this.listenOnOpen()
+      if (!r) return this.show({ screen: 'idle' })
       if (r.show) {
         this.keepAwake(READ_BRIGHT_MS)
         return this.show(r.show)
       }
+      this.state.pendingRid = saved && saved.model && saved.model.rid || null
       this.fetchLast(r.fetchLast, r.heard)
-    },
-
-    // A button shortcut opens the app: give the page time to appear, then record.
-    // Pending approvals and unfinished requests are resumed instead of overwritten.
-    listenOnOpen() {
-      this.show({ screen: 'idle' })
-      const timer = setTimeout(() => {
-        if (!this.state.busy && !this.state.recording) this.onTalk()
-      }, 300)
-      this.state.timers.push(timer)
     },
 
     // Reopened while a question was out: collect the reply the relay kept for us.
@@ -155,7 +146,7 @@ Page(
       this.state.busy = true
       this.state.waitSince = since
       this.keepAwake(WAIT_BRIGHT_MS)
-      this.show({ screen: 'thinking', heard, resume: true }) // has a Cancel button: a dead phone can't trap the app
+      this.show({ screen: 'thinking', heard, resume: true, rid: this.state.pendingRid }) // has a Cancel button: a dead phone can't trap the app
       const token = ++this.state.resumeToken
       let tries = 0
       const attempt = () => {
@@ -277,6 +268,7 @@ Page(
       } else if (m.screen === 'thinking' || m.screen === 'working') {
         this.renderWaiting(m)
       } else if (m.screen === 'confirm') {
+        y = this.text(y, this.state.profile === 'health' ? 'Health' : 'Default', 22, 0x999999)
         y = this.text(y + 20, m.heard, 24, 0x999999)
         y = this.text(y + 10, m.text, 32, 0xffffff)
         if (m.voiceNote) y = this.text(y + 6, m.voiceNote, 20, 0xf5b041)
@@ -316,9 +308,10 @@ Page(
     renderWaiting(m) {
       const spin = SPIN[m.screen]
       const dots = RING.map((p) => this.add(hmUI.widget.CIRCLE, { center_x: p.x, center_y: p.y, radius: DOT_R, color: spin.dim }))
-      this.add(hmUI.widget.IMG, { x: Math.round((W - 124) / 2), y: 72, src: 'icon.png' })
+      this.add(hmUI.widget.IMG, { x: Math.round((W - 124) / 2), y: 48, src: 'icon.png' })
+      this.add(hmUI.widget.TEXT, { x: MARGIN, y: 178, w: TEXT_W, h: 24, text: this.state.profile === 'health' ? 'Health' : 'Default', text_size: 20, color: 0x999999, align_h: hmUI.align.CENTER_H })
       const label = this.add(hmUI.widget.TEXT, {
-        x: MARGIN, y: 206, w: TEXT_W, h: 44, text: `${spin.label}.`, text_size: 32, color: spin.head,
+        x: MARGIN, y: 206, w: TEXT_W, h: 44, text: `${m.progress || this.state.progress || spin.label}.`, text_size: 26, color: spin.head,
         align_h: hmUI.align.CENTER_H,
       })
       const since = this.state.waitSince || Date.now()
@@ -330,7 +323,8 @@ Page(
       let y = 286
       if (heard) y = this.text(y, heard, 20, 0x999999)
       if (m.note) y = this.text(y, m.note, 20, SPIN.working.head) // "you can close the app" after an Approve
-      if (m.screen === 'working' || m.resume) this.button(Math.max(y + 8, 326), 'Cancel', GREY, () => this.cancelPoll(), Math.round(W * 0.4))
+      if (this.state.pendingRid || m.rid || m.job) this.button(Math.max(y + 8, 326), this.state.stopping ? 'Stopping' : 'Stop', GREY, () => this.stopRequest(), Math.round(W * 0.4))
+      else if (m.resume) this.button(Math.max(y + 8, 326), 'Back', GREY, () => this.cancelPoll(), Math.round(W * 0.4))
       let step = 0
       let shown = ''
       this.state.anim = setInterval(() => {
@@ -339,7 +333,7 @@ Page(
         for (let i = 0; i < RING_N; i++) {
           dots[i].setProperty(hmUI.prop.MORE, { center_x: RING[i].x, center_y: RING[i].y, radius: DOT_R, color: colors[i] })
         }
-        if (step % 6 === 0) label.setProperty(hmUI.prop.TEXT, `${this.state.waking ? 'Waking the phone' : spin.label}${dotsText(step / 6)}`)
+        if (step % 6 === 0) label.setProperty(hmUI.prop.TEXT, `${this.state.waking ? 'Waking the phone' : this.state.progress || spin.label}${dotsText(step / 6)}`)
         const t = elapsedText(Date.now() - since)
         if (t !== shown) clock.setProperty(hmUI.prop.TEXT, (shown = t))
       }, spin.tickMs)
@@ -440,7 +434,10 @@ Page(
         return this.finish({ ok: false, error: `Could not read the recording: ${errText(e)}` })
       }
       if (!audio) return this.finish({ ok: false, error: 'Nothing was recorded. Try again.' })
-      const envelope = buildEnvelope({ profile: this.state.profile, kind: 'ask', speak: this.state.voiceOn, rid: newRid() }, audio)
+      this.state.pendingRid = newRid()
+      this.state.progress = 'Sending recording'
+      this.show({ ...this.model, rid: this.state.pendingRid })
+      const envelope = buildEnvelope({ profile: this.state.profile, kind: 'ask', speak: this.state.voiceOn, rid: this.state.pendingRid }, audio)
       this.resendRequest(envelope, { contentType: 'bin', dataType: 'json' }, ASK_ATTEMPT_MS)
         .then((r) => this.finish(r))
         .catch((e) => this.finish({ ok: false, error: phoneError(e), __profile: e.__profile, __epoch: e.__epoch }))
@@ -448,10 +445,13 @@ Page(
 
     // ------------------------------------------------------------------ replies
     finish(reply) {
+      if (reply && reply.__cancelled) return
       if (reply && ((reply.__profile && reply.__profile !== this.state.profile) || (reply.__epoch !== undefined && reply.__epoch !== this.state.profileEpoch))) return
       const m = screenFor(reply)
       if (m.screen === 'working') return this.startPoll(m)
       this.state.busy = false
+      this.state.pendingRid = null
+      this.state.progress = ''
       this.keepAwake(READ_BRIGHT_MS)
       if (m.screen !== 'working') vibrate()
       this.show(m)
@@ -586,6 +586,8 @@ Page(
 
     startPoll(m) {
       this.state.busy = true
+      this.state.pendingRid = m.rid || this.state.pendingRid
+      this.state.progress = m.progress || 'Working'
       this.show(m)
       const token = ++this.state.resumeToken
       const started = Date.now()
@@ -602,7 +604,15 @@ Page(
           if (token !== this.state.resumeToken) return
           inFlight = false
           const next = pollStep(r, failures)
-          if (!next.done) return (failures = next.failures)
+          if (!next.done) {
+            failures = next.failures
+            if (r && r.progress) {
+              this.state.progress = r.progress
+              this.model = { ...this.model, progress: r.progress }
+              this.save(this.model)
+            }
+            return
+          }
           this.cancelPoll()
           const done = next.reply
           this.finish(done && done.ok && !done.heard && m.heard ? { ...done, heard: m.heard.replace(/^You said: /, '') } : done)
@@ -611,6 +621,33 @@ Page(
           .then(step)
           .catch(() => step(null)) // a dropped poll is retried on the next tick
       }, POLL_MS)
+    },
+
+    async stopRequest() {
+      if (this.state.stopping) return
+      const m = this.model || {}
+      const params = { job: m.job || '', rid: m.rid || this.state.pendingRid || '' }
+      if (!params.job && !params.rid) return this.cancelPoll()
+      this.stopVoice()
+      this.state.resumeToken++ // fence the original request's late reply and retries
+      if (this.state.poll) clearInterval(this.state.poll)
+      this.state.poll = null
+      this.state.stopping = true
+      this.state.progress = 'Stopping'
+      this.show({ ...m, progress: 'Stopping' })
+      try {
+        const reply = await this.phoneRequest({ method: 'stop', params }, { timeout: 20000 })
+        this.state.stopping = false
+        if (!reply || !reply.ok) {
+          this.state.progress = 'Stop not confirmed'
+          return this.show({ ...m, progress: 'Stop not confirmed', note: reply && reply.error || 'Try Stop again.' })
+        }
+        this.finish(reply)
+      } catch (e) {
+        this.state.stopping = false
+        this.state.progress = 'Stop not confirmed'
+        this.show({ ...m, progress: 'Stop not confirmed', note: phoneError(e) })
+      }
     },
 
     cancelPoll() {
@@ -624,11 +661,17 @@ Page(
     // phoneRequest, sent again (same request id) when an attempt gets no reply in attemptMs or the
     // phone says it couldn't reach the PC ({retry: true}); the only place lost replies are retried.
     resendRequest(req, opts, attemptMs) {
-      const profile = this.state.profile, epoch = this.state.profileEpoch
-      return resendUntil(() => epoch === this.state.profileEpoch
+      const profile = this.state.profile, epoch = this.state.profileEpoch, token = this.state.resumeToken
+      if (req && req.params && req.params.rid) {
+        this.state.pendingRid = req.params.rid
+        this.model = { ...this.model, rid: req.params.rid }
+        this.save(this.model)
+      }
+      return resendUntil(() => token !== this.state.resumeToken
+        ? Promise.resolve({ ok: false, __cancelled: true }) : epoch === this.state.profileEpoch
         ? this.phoneRequest(req, { ...opts, timeout: attemptMs }, profile, epoch)
         : Promise.resolve({ ok: false, error: 'Profile changed', __profile: profile, __epoch: epoch }),
-        { attemptMs, budgetMs: REQUEST_BUDGET_MS })
+        { attemptMs, budgetMs: REQUEST_BUDGET_MS }).then(r => token === this.state.resumeToken ? r : { __cancelled: true })
     },
 
     // request() to the phone, retried for up to 30 s while iOS wakes the Zepp app ("shake timeout");
@@ -653,6 +696,7 @@ Page(
       this.resendRequest({ method: 'newChat', params: { rid: newRid() } }, {}, ASK_ATTEMPT_MS)
         .catch((e) => ({ ok: false, error: phoneError(e), __profile: e.__profile, __epoch: e.__epoch }))
         .then((r) => {
+          if (r && r.__cancelled) return
           if (r && r.__epoch !== undefined && r.__epoch !== this.state.profileEpoch) return
           if (!r || !r.ok) return this.finish(r)
           this.state.busy = false

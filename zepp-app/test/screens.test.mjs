@@ -113,3 +113,11 @@ test('poll: an answer or a real error ends it', () => {
   const e = { ok: false, error: 'The watch token was rejected by the PC.' }
   assert.deepStrictEqual(pollStep(e, 0), { done: true, reply: e })
 })
+
+
+test('working screen carries progress and request identity for scoped Stop', () => {
+  const r = screenFor({ ok: true, kind: 'working', job: 'j1', rid: 'r1', progress: 'Checking food entry' });
+  assert.equal(r.progress, 'Checking food entry');
+  assert.equal(r.rid, 'r1');
+  assert.equal(r.job, 'j1');
+});

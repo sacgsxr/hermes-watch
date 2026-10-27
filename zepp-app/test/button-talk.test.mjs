@@ -6,7 +6,7 @@ import { resumeFor } from '../shared/screens.js'
 import { checkedProfile, savedScreenKey, scopedRequest } from '../shared/profiles.js'
 
 for (const screen of [null, 'answer', 'confirm', 'working']) {
-  test(`opening app with ${screen || 'fresh'} state ${screen === 'confirm' || screen === 'working' ? 'resumes pending work' : 'starts listening'}`, () => {
+  test(`opening app with ${screen || 'fresh'} state ${screen === 'confirm' || screen === 'working' ? 'resumes pending work' : 'shows the selected profile without recording'}`, () => {
     let page, talked = 0, fetched = 0
     const shown = [], timers = []
     const saved = screen ? { at: Date.now(), since: Date.now(), model: { screen, text: 'saved', approve: true } } : null
@@ -25,7 +25,7 @@ for (const screen of [null, 'answer', 'confirm', 'working']) {
     assert.equal(page.state.profile, 'health')
     assert.equal(talked, 0)
     for (const timer of timers) timer()
-    assert.equal(talked, screen === 'confirm' || screen === 'working' ? 0 : 1)
+    assert.equal(talked, 0)
     assert.equal(fetched, screen === 'working' ? 1 : 0)
     if (screen === 'confirm') assert.deepEqual(shown, ['confirm'])
   })

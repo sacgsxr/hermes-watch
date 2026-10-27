@@ -19,6 +19,8 @@
 //
 // Exposed tailnet-only: tailscale serve --bg --https=8453 http://127.0.0.1:8796
 const http = require('http');
+const { streamStage } = require('./lib/watch-progress');
+const { createRun } = require('./lib/hermes-run');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -39,9 +41,9 @@ function promptWithRules(text, rules) {
   return `${text}\n\n(Rule for this answer: ${rules.join(' ')})`;
 }
 // Minimal system prompt for the safe slice: no email-reading rule, no Claude Code tooling
-// rule, no CONFIRM action proposals - just the watch format and the clock.
-function safeSystemPrompt(now = new Date()) {
-  return `You are answering through Hermes on an Amazfit watch. Current date and time: ${timeString(Intl.DateTimeFormat().resolvedOptions().timeZone)}. `
+// rule, no CONFIRM action proposals - just the stable watch format.
+function safeSystemPrompt() {
+  return 'You are answering through Hermes on an Amazfit watch. '
     + 'The message is raw speech-to-text: expect misheard words, run-on phrasing and missing punctuation; read it charitably. '
     + `Plain text only - no markdown, links or images. Under ${WATCH_CHAR_BUDGET} characters. ${NO_ACTION_RULE}`;
 }
@@ -79,10 +81,12 @@ function createServer(opts) {
   // Prompt rules for this build: the full watch rules when actions are enabled (the default,
   // as in tests), or just "no direct actions" for the safe slice.
   const systemPrompt = opts.systemPrompt !== undefined ? opts.systemPrompt
-    : (agentActionsEnabled ? () => safeSystemPrompt().replace(NO_ACTION_RULE, AGENT_ACTION_RULE) : actionsEnabled ? watchSystemPrompt : safeSystemPrompt);
+    : (agentActionsEnabled ? () => safeSystemPrompt().replace(NO_ACTION_RULE, AGENT_ACTION_RULE) : actionsEnabled ? () => watchSystemPrompt(undefined, { includeClock: false }) : safeSystemPrompt);
   const turnRules = opts.turnRules || ((text) => agentActionsEnabled ? text : actionsEnabled ? withWatchRules(text)
     : promptWithRules(text, [NO_ACTION_RULE]));
+  const requestNow = opts.now || (() => new Date());
   const jobs = new Map();
+  const requests = new Map(); // profile-local request id -> transcription/job state
   const ownedPending = new Map();
   function createPending(action) {
     for (const [id, at] of ownedPending) if (Date.now() - at > actions.CONFIRM_TTL_MS) ownedPending.delete(id);
@@ -121,17 +125,29 @@ function createServer(opts) {
 
   // A Hermes turn, streamed: the text is collected, and approval requests (Claude Code edits and
   // builds, dangerous commands) are handed to onApproval while Hermes waits for the answer.
-  function askHermes(sessionId, userText, onApproval = () => {}) {
+  function askHermes(sessionId, userText, onApproval = () => {}, onProgress = () => {}) {
     let up;
+    let streamResponse;
+    let runId;
+    if (opts.nativeRuns) {
+      const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const context = `[Watch request context: current local date and time: ${timeString(zone, zone, requestNow())}.]`;
+      return createRun(opts, sessionId, systemPrompt(), `${turnRules(userText)}\n\n${context}`, onApproval, onProgress);
+    }
     const promise = new Promise((resolve) => {
       let settled = false;
       const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+      // Keep changing clock text out of the system prefix and Hermes agent-cache key.
+      // Fresh local time belongs with this turn so food logs still interpret today correctly.
+      const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const context = `[Watch request context: current local date and time: ${timeString(zone, zone, requestNow())}.]`;
       const body = Buffer.from(JSON.stringify({ model: 'hermes-agent', stream: true, messages: [
         { role: 'system', content: systemPrompt() },
-        { role: 'user', content: turnRules(userText) }] }));
+        { role: 'user', content: `${turnRules(userText)}\n\n${context}` }] }));
       up = http.request({ host: '127.0.0.1', port: opts.hermesPort, method: 'POST', path: `${opts.hermesPathPrefix || ''}/v1/chat/completions`, headers: {
         authorization: `Bearer ${opts.hermesKey}`, 'content-type': 'application/json', 'content-length': body.length,
         'x-hermes-session-id': sessionId } }, (res) => {
+        streamResponse = res;
         let buf = '';
         let text = '';
         const raw = [];
@@ -145,6 +161,12 @@ function createServer(opts) {
             buf = buf.slice(i + 2);
             const event = (frame.match(/^event: *(.+)$/m) || [])[1] || 'message';
             const data = frame.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n');
+            try {
+              const payload = JSON.parse(data);
+              if (payload.id && !runId) runId = payload.id;
+              const progress = streamStage(event, payload);
+              if (progress) onProgress(progress);
+            } catch { /* heartbeat or DONE */ }
             if (event === 'approval.request') {
               try { onApproval(JSON.parse(data)); } catch (e) { log(`  bad approval event: ${e.message}`); }
             } else if (event === 'message' && data && data !== '[DONE]') {
@@ -159,7 +181,73 @@ function createServer(opts) {
       up.on('close', () => done({ status: 0, text: '', raw: 'connection closed before an answer' }));
       up.end(body);
     });
-    return { promise, cancel: why => up.destroy(new Error(why)) };
+    const cancel = why => {
+      if (streamResponse) streamResponse.destroy();
+      if (up) up.destroy(new Error(why));
+    };
+    return { promise, cancel, async stop() {
+      // Prefer Hermes's exact run control. Closing this stream is its supported
+      // disconnect/interrupt fallback, scoped to this one request and agent.
+      let status = 0;
+      if (runId) status = await stopRun(runId);
+      cancel('Watch requested stop');
+      return status;
+    } };
+
+  }
+
+  function stopRun(runId) {
+    return new Promise(resolve => {
+      const req = http.request({ host: '127.0.0.1', port: opts.hermesPort, method: 'POST',
+        path: `${opts.hermesPathPrefix || ''}/v1/runs/${encodeURIComponent(runId)}/stop`,
+        headers: { authorization: `Bearer ${opts.hermesKey}`, 'content-type': 'application/json' } }, res => {
+        res.resume(); res.on('end', () => resolve(res.statusCode));
+      });
+      req.setTimeout(2000, () => req.destroy(new Error('stop timed out')));
+      req.on('error', () => resolve(0)); req.end('{}');
+    });
+  }
+
+  const stoppedReply = heard => ({ ok: true, heard: heard || '', kind: 'answer', stopped: true,
+    text: 'Stop requested. Anything already saved stays saved.' });
+
+  async function stopRequest(body) {
+    let ctx = body.rid && requests.get(String(body.rid));
+    if (!ctx && !body.job && typeof body.rid === 'string' && body.rid.length > 0 && body.rid.length < 160) {
+      ctx = { rid: body.rid, cancelled: true, at: Date.now() };
+      requests.set(body.rid, ctx); // Stop can beat upload/transcription; fence its later arrival.
+    }
+    const entry = body.job ? jobs.get(String(body.job)) : ctx && ctx.entry;
+    if (!entry && !ctx) return { ok: false, error: 'That watch request is no longer available.' };
+    if (entry && entry.reply) return { ...entry.reply, already_finished: true };
+    if (ctx) ctx.cancelled = true;
+    if (!entry) return stoppedReply(''); // transcription may finish, but must never start Hermes
+    if (entry.stopping) return entry.stopping;
+    entry.cancelled = true; entry.progress = 'Stopping';
+    entry.stopping = (async () => {
+      const status = await entry.turn.stop();
+      log(`  stop requested job=${entry.job} native_status=${status} run=${entry.turn.runId || "chat"}`);
+      if (entry.turn.native && !(status >= 200 && status < 300)) {
+        entry.cancelled = false; entry.stopping = null; entry.progress = 'Stop not confirmed';
+        if (entry.pendingDone) {
+          entry.reply = remember(toReply(entry.heard, entry.pendingDone));
+          if (entry.wake) entry.wake();
+          return { ...entry.reply, already_finished: true };
+        }
+        return { ok: false, error: 'Hermes did not confirm Stop. Try again.' };
+      }
+      for (const [id, a] of approvals) if (a.entry === entry) approvals.delete(id);
+      entry.card = null;
+      if (entry.pendingDone && entry.pendingDone.status === 200) {
+        entry.reply = remember(toReply(entry.heard, entry.pendingDone));
+        if (entry.wake) entry.wake();
+        return { ...entry.reply, already_finished: true };
+      }
+      entry.reply = remember(stoppedReply(entry.heard));
+      if (entry.wake) entry.wake();
+      return entry.reply;
+    })();
+    return entry.stopping;
   }
 
   // POST /v1/runs/{id}/approval: once | deny. Resolves to Hermes' HTTP status (0 = no connection).
@@ -219,27 +307,32 @@ function createServer(opts) {
   function collect(job, entry) {
     if (entry.card) return entry.card;
     if (entry.reply) return entry.reply;
-    return { ok: true, heard: entry.heard, kind: 'working', job, ...(entry.approved ? { note: BUILD_NOTE } : {}) };
+    return { ok: true, heard: entry.heard, kind: 'working', job, rid: entry.rid, progress: entry.progress, elapsed_ms: Date.now() - entry.at, ...(entry.approved ? { note: BUILD_NOTE } : {}) };
   }
 
-  async function hermesTurn(heard, userText, started) {
+  async function hermesTurn(heard, userText, started, ctx = {}) {
     const sessionId = currentSession();
     const job = crypto.randomBytes(9).toString('base64url');
-    const entry = { heard, at: Date.now(), reply: null, card: null, approved: false, wake: null };
+    const entry = { heard, at: started, reply: null, card: null, approved: false, wake: null,
+      job, rid: ctx.rid || '', progress: 'Starting model', cancelled: false };
+    ctx.entry = entry;
     jobs.set(job, entry);
     const turn = askHermes(sessionId, userText, (ev) => {
+      if (entry.cancelled) return;
       const id = crypto.randomBytes(6).toString('hex');
       approvals.set(id, { runId: ev.run_id, requestId: ev.request_id, job, entry });
       const asked = String(ev.command || ev.description || 'Approve this?').replace(/\n\s*\n/g, '\n');
       entry.card = { ok: true, heard, kind: 'confirm', approve: true, text: truncateForHud(formatForHud(asked), WATCH_CHAR_BUDGET), id };
       log(`  approval asked (${ev.pattern_key || 'approval'}) card=${id} job=${job}`);
       if (entry.wake) entry.wake();
-    });
+    }, progress => { if (!entry.cancelled) entry.progress = progress; });
+    entry.turn = turn;
     const cap = setTimeout(() => turn.cancel('stopped waiting after 30 min'), JOB_CAP_MS);
     turn.promise.then((done) => {
       clearTimeout(cap);
       for (const [id, a] of approvals) if (a.entry === entry) approvals.delete(id);
       entry.card = null;
+      if (entry.cancelled) { entry.pendingDone = done; return; }
       entry.reply = remember(toReply(heard, done));
       log(`  -> ${done.status} ${Date.now() - started}ms session=${sessionId} job=${job}`);
       if (notifyEnabled && entry.approved && entry.reply.text) notify(`From the watch: ${heard || 'your approval'}\n\n${entry.reply.text}`);
@@ -293,7 +386,7 @@ function createServer(opts) {
     });
   }
 
-  async function ask(body) {
+  async function ask(body, ctx = {}) {
     const started = Date.now();
     let heard = typeof body.text === 'string' ? body.text.trim() : '';
     if (body.audio_b64 !== undefined) {
@@ -301,6 +394,7 @@ function createServer(opts) {
       if (stt.error) return { ok: false, error: stt.error };
       heard = stt.text;
     }
+    if (ctx.cancelled) return stoppedReply(heard);
     log(`ask: ${heard.slice(0, 120)}`);
     if (!heard) return { ok: true, heard, kind: 'answer', text: "I didn't catch that." };
     if (isResetCommand(heard)) {
@@ -328,12 +422,12 @@ function createServer(opts) {
       return answered(heard, { ok: true, heard, kind: 'confirm', text: action.summary, id });
     }
     denyPending();
-    return hermesTurn(heard, heard, started);
+    return hermesTurn(heard, heard, started, ctx);
   }
 
-  async function confirm(body) {
+  async function confirm(body, ctx = {}) {
     const pendingApproval = approvals.get(String(body.id || ''));
-    if (pendingApproval) return approve({ id: String(body.id), ...pendingApproval }, !!body.yes);
+    if (pendingApproval) { ctx.entry = pendingApproval.entry; return approve({ id: String(body.id), ...pendingApproval }, !!body.yes); }
     const action = takePending(String(body.id || ''));
     if (!action) return { ok: true, kind: 'answer', text: 'That expired, ask again.' };
     if (action.kind === 'hermes' && !body.yes) {
@@ -345,7 +439,7 @@ function createServer(opts) {
       return { ok: true, kind: 'answer', text: 'OK, not doing it.' };
     }
     if (action.kind === 'hermes') {
-      const reply = await hermesTurn('', 'yes, go ahead', Date.now());
+      const reply = await hermesTurn('', 'yes, go ahead', Date.now(), ctx);
       delete reply.heard;
       return reply;
     }
@@ -364,7 +458,7 @@ function createServer(opts) {
   const speeches = new Map(); // id -> {parts: [text], audio: [Promise<Buffer>|null], at}
 
   function withSpeech(reply, speak) {
-    if (!speak || !reply || !reply.ok || reply.approve || !['answer', 'confirm'].includes(reply.kind)) return reply;
+    if (!speak || !reply || !reply.ok || reply.stopped || reply.approve || !['answer', 'confirm'].includes(reply.kind)) return reply;
     const text = speechText(reply.text || '');
     if (!text) return reply;
     for (const [k, v] of speeches) if (Date.now() - v.at > JOB_KEEP_MS) speeches.delete(k);
@@ -405,7 +499,7 @@ function createServer(opts) {
     const entry = jobs.get(job);
     if (!entry) return { ok: true, kind: 'answer', text: 'That answer is no longer here. Ask again.' };
     const reply = collect(job, entry);
-    if (reply.kind === 'working') return { ok: true, kind: 'working', ...(reply.note ? { note: reply.note } : {}) };
+    if (reply.kind === 'working') return reply;
     log(`  result collected job=${job}${reply.approve ? ' (approval card)' : ''}`);
     const out = reply.heard === '' ? (({ heard, ...rest }) => rest)(reply) : reply;
     if (!speak) return out;
@@ -451,7 +545,7 @@ function createServer(opts) {
     if (req.method === 'GET' && url.pathname === '/watch/last') {
       return send(200, last ? { ...last.reply, ago_ms: Date.now() - last.at } : { ok: true, kind: 'none' });
     }
-    if (req.method !== 'POST' || !['/watch/ask', '/watch/confirm', '/watch/result', '/watch/diag'].includes(url.pathname)) return send(404, { ok: false, error: 'not found' });
+    if (req.method !== 'POST' || !['/watch/ask', '/watch/confirm', '/watch/result', '/watch/diag', '/watch/stop'].includes(url.pathname)) return send(404, { ok: false, error: 'not found' });
     const chunks = [];
     let size = 0;
     req.on('data', (c) => { size += c.length; if (size <= MAX_BODY) chunks.push(c); });
@@ -470,6 +564,10 @@ function createServer(opts) {
         return send(200, { ok: true });
       }
       if (url.pathname === '/watch/result') return send(200, result(String(body.job || ''), body.speak));
+      if (url.pathname === '/watch/stop') {
+        stopRequest(body).then(r => send(200, r)).catch(() => send(200, { ok: false, error: 'Could not request stop. Try again.' }));
+        return;
+      }
       // The phone retries a request whose reply got lost with the same rid; it gets the same
       // reply (waiting for it if still running), so Hermes and actions run once.
       const key = typeof body.rid === 'string' && body.rid ? `${url.pathname} ${body.rid}` : '';
@@ -477,7 +575,11 @@ function createServer(opts) {
       let reply = key && replies.has(key) ? replies.get(key).promise : null;
       if (reply) log(`  retry ${key}`);
       else {
-        reply = (url.pathname === '/watch/ask' ? ask(body) : confirm(body)).then(remember)
+        const ctx = requests.get(body.rid) || { rid: typeof body.rid === 'string' ? body.rid : '', cancelled: false };
+        if (ctx.rid) requests.set(ctx.rid, ctx);
+        for (const [rid, old] of requests) if (old.at && Date.now() - old.at > JOB_KEEP_MS) requests.delete(rid);
+        ctx.at = Date.now();
+        reply = (url.pathname === '/watch/ask' ? ask(body, ctx) : confirm(body, ctx)).then(remember)
           .then(r => withSpeech(r, body.speak))
           .catch((e) => { log(`relay error: ${e.stack || e}`); return { ok: false, error: `Relay error: ${e.message}` }; });
         if (key) replies.set(key, { promise: reply, at: Date.now() });
@@ -598,6 +700,7 @@ if (require.main === module) {
   const defaultOptions = {
     token: config.token,
     hermesKey,
+    nativeRuns: true,
     hermesPort: Number(process.env.WATCH_HERMES_PORT) || 8643,
     sttUrl: process.env.WATCH_STT_URL || 'http://127.0.0.1:8797/stt',
     sessionFile: process.env.WATCH_SESSION_FILE || path.join(__dirname, 'session.json'),

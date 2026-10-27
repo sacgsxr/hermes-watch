@@ -184,6 +184,7 @@ AppSideService(
         work = call('POST', '/watch/confirm', { id: p.id, yes: !!p.yes, rid: p.rid || newRid(), speak: !!p.speak }, CONFIRM_MS, profile)
       }
       else if (req.method === 'result') work = call('POST', '/watch/result', { job: p.job || '', speak: !!p.speak }, POLL_MS, profile)
+      else if (req.method === 'stop') work = call('POST', '/watch/stop', { job: p.job || '', rid: p.rid || '' }, POLL_MS, profile)
       else if (req.method === 'speech') work = onceBy(speechJobs, `${profile}:${p.id || ''}`, () => sendSpeechClips(this, String(p.id || ''), Number(p.parts) || 1, 'watch asked', profile))
       else if (req.method === 'diag') {
         diag('watch', ...(Array.isArray(p.events) ? p.events : []))
